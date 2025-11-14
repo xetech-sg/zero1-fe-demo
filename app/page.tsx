@@ -31,6 +31,10 @@ export default function HomePage() {
   const [recordingError, setRecordingError] = useState("");
   const [volumeLevel, setVolumeLevel] = useState(0); // 0–1 range for visual meter
 
+  // TTS (speech playback) state
+  const [isSpeaking, setIsSpeaking] = useState(false);
+  const [ttsError, setTtsError] = useState("");
+
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const mediaStreamRef = useRef<MediaStream | null>(null);
   const audioChunksRef = useRef<BlobPart[]>([]);
@@ -55,6 +59,8 @@ export default function HomePage() {
       setInput("");
     }
     setErrorText("");
+    setTtsError("");
+
     setLoading(true);
 
     try {
@@ -218,13 +224,17 @@ export default function HomePage() {
         setRecordingError(
           "Browser requires HTTPS or localhost for microphone access. Please open this demo on http://localhost:3000 or via HTTPS."
         );
-        console.warn("[recording] Insecure context: microphone access is blocked.");
+        console.warn(
+          "[recording] Insecure context: microphone access is blocked."
+        );
         return;
       }
 
       if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
         setRecordingError("Microphone is not supported in this browser.");
-        console.warn("[recording] navigator.mediaDevices.getUserMedia is not available");
+        console.warn(
+          "[recording] navigator.mediaDevices.getUserMedia is not available"
+        );
         return;
       }
 
@@ -318,6 +328,45 @@ export default function HomePage() {
 
   const showThinking = loading || isTranscribing;
 
+  // TTS playback using browser's SpeechSynthesis API
+  const speakText = (text: string) => {
+    setTtsError("");
+
+    if (typeof window === "undefined" || !("speechSynthesis" in window)) {
+      setTtsError(
+        "Browser does not support speech playback. Please try Chrome or Edge."
+      );
+      return;
+    }
+
+    try {
+      // Cancel any ongoing speech
+      window.speechSynthesis.cancel();
+
+      const utterance = new SpeechSynthesisUtterance(text);
+      // Slightly slower rate for senior-friendly playback
+      utterance.rate = 0.9;
+
+      utterance.onstart = () => {
+        setIsSpeaking(true);
+      };
+      utterance.onend = () => {
+        setIsSpeaking(false);
+      };
+      utterance.onerror = (event) => {
+        console.error("Speech synthesis error:", event);
+        setIsSpeaking(false);
+        setTtsError("Could not play audio for this reply.");
+      };
+
+      window.speechSynthesis.speak(utterance);
+    } catch (err) {
+      console.error("speakText error:", err);
+      setIsSpeaking(false);
+      setTtsError("Could not play audio for this reply.");
+    }
+  };
+
   return (
     <main className="min-h-screen bg-gradient-to-br from-slate-900 via-slate-950 to-slate-900 text-slate-100 flex items-center justify-center px-4 py-8">
       <div className="w-full max-w-4xl bg-slate-900/70 border border-slate-700/60 rounded-3xl shadow-2xl backdrop-blur-xl overflow-hidden flex flex-col h-[80vh]">
@@ -338,6 +387,9 @@ export default function HomePage() {
             </p>
             <p className="text-xs text-emerald-400">
               Backend: GPU-enabled local LLM + ASR
+            </p>
+            <p className="text-[10px] text-slate-500 mt-1">
+              Assistant replies support text + prototype voice playback
             </p>
           </div>
         </header>
@@ -385,7 +437,19 @@ export default function HomePage() {
                     : "bg-slate-800/80 text-slate-100 rounded-bl-sm border border-slate-700/70"
                 }`}
               >
-                {msg.content}
+                <div>{msg.content}</div>
+
+                {/* TTS play button only for assistant messages */}
+                {msg.role === "assistant" && (
+                  <button
+                    type="button"
+                    onClick={() => speakText(msg.content)}
+                    className="mt-2 inline-flex items-center text-[11px] text-emerald-300 hover:text-emerald-200 transition-colors"
+                  >
+                    <span className="mr-1">🔊</span>
+                    {isSpeaking ? "Playing reply..." : "Play voice reply"}
+                  </button>
+                )}
               </div>
             </div>
           ))}
@@ -400,6 +464,11 @@ export default function HomePage() {
         {recordingError && (
           <div className="px-6 pb-1 text-xs text-amber-400">
             {recordingError}
+          </div>
+        )}
+        {ttsError && (
+          <div className="px-6 pb-1 text-xs text-amber-300">
+            {ttsError}
           </div>
         )}
 
