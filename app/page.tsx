@@ -29,10 +29,15 @@ export default function HomePage() {
   const [isRecording, setIsRecording] = useState(false);
   const [isTranscribing, setIsTranscribing] = useState(false);
   const [recordingError, setRecordingError] = useState("");
+  const [volumeLevel, setVolumeLevel] = useState(0); // 0–1 range for visual meter
 
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const mediaStreamRef = useRef<MediaStream | null>(null);
   const audioChunksRef = useRef<BlobPart[]>([]);
+
+  const audioContextRef = useRef<AudioContext | null>(null);
+  const analyserRef = useRef<AnalyserNode | null>(null);
+  const animationFrameRef = useRef<number | null>(null);
 
   // Send message to backend API
   const sendMessage = async (overrideText?: string) => {
@@ -101,7 +106,8 @@ export default function HomePage() {
 
     try {
       const formData = new FormData();
-      formData.append("file", blob, "audio.webm");
+      // IMPORTANT: field name must be "audio" to match /api/asr route.ts
+      formData.append("audio", blob, "audio.webm");
 
       const res = await fetch(ASR_ROUTE, {
         method: "POST",
@@ -109,6 +115,8 @@ export default function HomePage() {
       });
 
       if (!res.ok) {
+        const text = await res.text().catch(() => "");
+        console.error("ASR /api/asr non-OK:", res.status, text);
         throw new Error("ASR request failed");
       }
 
@@ -140,18 +148,94 @@ export default function HomePage() {
     await sendMessage(text);
   }
 
+  // Start visual volume analysis using Web Audio API
+  function startVolumeVisualization(stream: MediaStream) {
+    try {
+      const AudioContextClass =
+        (window as any).AudioContext || (window as any).webkitAudioContext;
+      const audioContext = new AudioContextClass();
+      const analyser = audioContext.createAnalyser();
+
+      analyser.fftSize = 256;
+      analyser.smoothingTimeConstant = 0.8;
+
+      const source = audioContext.createMediaStreamSource(stream);
+      source.connect(analyser);
+
+      audioContextRef.current = audioContext;
+      analyserRef.current = analyser;
+
+      const bufferLength = analyser.frequencyBinCount;
+      const dataArray = new Uint8Array(bufferLength);
+
+      const update = () => {
+        if (!analyserRef.current) return;
+        analyserRef.current.getByteTimeDomainData(dataArray);
+
+        // Compute a simple RMS-like value to represent volume
+        let sum = 0;
+        for (let i = 0; i < dataArray.length; i++) {
+          const value = dataArray[i] - 128;
+          sum += value * value;
+        }
+        const rms = Math.sqrt(sum / dataArray.length);
+        // Normalize between 0 and ~1
+        const normalized = Math.min(1, rms / 50);
+        setVolumeLevel(normalized);
+
+        animationFrameRef.current = requestAnimationFrame(update);
+      };
+
+      update();
+    } catch (err) {
+      console.error("startVolumeVisualization error", err);
+    }
+  }
+
+  // Stop the volume visualization
+  function stopVolumeVisualization() {
+    if (animationFrameRef.current !== null) {
+      cancelAnimationFrame(animationFrameRef.current);
+      animationFrameRef.current = null;
+    }
+    if (audioContextRef.current) {
+      audioContextRef.current.close().catch(() => {});
+      audioContextRef.current = null;
+    }
+    analyserRef.current = null;
+    setVolumeLevel(0);
+  }
+
   // Start recording from the microphone
   const startRecording = async () => {
     try {
       setRecordingError("");
 
-      if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-        setRecordingError("Microphone is not supported in this browser.");
+      // Check if the page is in a secure context
+      if (typeof window !== "undefined" && window.isSecureContext === false) {
+        // On non-secure origins (not https and not localhost),
+        // browsers will block getUserMedia even if the user clicks "Allow".
+        setRecordingError(
+          "Browser requires HTTPS or localhost for microphone access. Please open this demo on http://localhost:3000 or via HTTPS."
+        );
+        console.warn("[recording] Insecure context: microphone access is blocked.");
         return;
       }
 
+      if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+        setRecordingError("Microphone is not supported in this browser.");
+        console.warn("[recording] navigator.mediaDevices.getUserMedia is not available");
+        return;
+      }
+
+      console.log("[recording] Requesting microphone...");
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      console.log("[recording] Got audio stream:", stream);
+
       mediaStreamRef.current = stream;
+
+      // Start volume visualization
+      startVolumeVisualization(stream);
 
       // Reset chunks
       audioChunksRef.current = [];
@@ -159,40 +243,55 @@ export default function HomePage() {
       const recorder = new MediaRecorder(stream);
       mediaRecorderRef.current = recorder;
 
-      recorder.ondataavailable = (event: BlobEvent) => {
+      recorder.ondataavailable = (event: any) => {
         if (event.data && event.data.size > 0) {
           audioChunksRef.current.push(event.data);
         }
       };
 
       recorder.onstop = async () => {
+        console.log("[recording] Recorder stopped");
+
         // Stop all tracks to release the microphone
         if (mediaStreamRef.current) {
           mediaStreamRef.current.getTracks().forEach((track) => track.stop());
           mediaStreamRef.current = null;
         }
 
+        // Stop volume visualization
+        stopVolumeVisualization();
+
         const audioBlob = new Blob(audioChunksRef.current, {
           type: "audio/webm",
         });
         audioChunksRef.current = [];
 
+        console.log("[recording] Collected audio blob:", audioBlob);
         await handleAudioBlob(audioBlob);
       };
 
       recorder.start();
+      console.log("[recording] Recorder started");
       setIsRecording(true);
-    } catch (err) {
-      console.error("startRecording error", err);
+    } catch (err: any) {
+      console.error(
+        "startRecording error",
+        err,
+        err?.name,
+        err?.message
+      );
       setRecordingError(
-        "Could not access microphone. Please check permissions and try again."
+        `Could not access microphone (${err?.name || "error"}). Please check permissions and try again.`
       );
     }
   };
 
   // Stop recording if currently active
   const stopRecording = () => {
-    if (mediaRecorderRef.current && mediaRecorderRef.current.state !== "inactive") {
+    if (
+      mediaRecorderRef.current &&
+      mediaRecorderRef.current.state !== "inactive"
+    ) {
       mediaRecorderRef.current.stop();
     }
     setIsRecording(false);
@@ -217,8 +316,7 @@ export default function HomePage() {
     }
   };
 
-  const showThinking =
-    loading || isTranscribing;
+  const showThinking = loading || isTranscribing;
 
   return (
     <main className="min-h-screen bg-gradient-to-br from-slate-900 via-slate-950 to-slate-900 text-slate-100 flex items-center justify-center px-4 py-8">
@@ -328,28 +426,41 @@ export default function HomePage() {
           </div>
 
           <div className="flex items-end gap-3">
-            {/* Microphone button for voice input */}
-            <button
-              type="button"
-              onClick={handleToggleRecording}
-              disabled={loading || isTranscribing}
-              className={`flex items-center justify-center rounded-full px-3 py-2 text-xs font-medium border transition-colors ${
-                isRecording
-                  ? "border-red-400 text-red-300 bg-red-950/40"
-                  : "border-emerald-400/70 text-emerald-300 bg-slate-900"
-              } disabled:opacity-50 disabled:cursor-not-allowed`}
-            >
-              <span
-                className={`w-2 h-2 rounded-full mr-2 ${
-                  isRecording ? "bg-red-400 animate-pulse" : "bg-emerald-400"
-                }`}
-              />
-              {isRecording
-                ? "Listening... Tap to stop"
-                : isTranscribing
-                ? "Transcribing..."
-                : "Tap to speak"}
-            </button>
+            {/* Microphone button for voice input + volume visualization */}
+            <div className="flex flex-col items-start gap-1">
+              <button
+                type="button"
+                onClick={handleToggleRecording}
+                disabled={loading || isTranscribing}
+                className={`flex items-center justify-center rounded-full px-3 py-2 text-xs font-medium border transition-colors ${
+                  isRecording
+                    ? "border-red-400 text-red-300 bg-red-950/40"
+                    : "border-emerald-400/70 text-emerald-300 bg-slate-900"
+                } disabled:opacity-50 disabled:cursor-not-allowed`}
+              >
+                <span
+                  className={`w-2 h-2 rounded-full mr-2 ${
+                    isRecording ? "bg-red-400 animate-pulse" : "bg-emerald-400"
+                  }`}
+                />
+                {isRecording
+                  ? "Listening... Tap to stop"
+                  : isTranscribing
+                  ? "Transcribing..."
+                  : "Tap to speak"}
+              </button>
+              {/* Simple volume bar (only meaningful while recording) */}
+              <div className="h-2 w-24 bg-slate-800 rounded-full overflow-hidden ml-1">
+                <div
+                  className="h-full bg-emerald-400 transition-[width] duration-75"
+                  style={{
+                    width: `${Math.round(
+                      Math.min(1, volumeLevel) * 100
+                    )}%`,
+                  }}
+                />
+              </div>
+            </div>
 
             <textarea
               className="flex-1 resize-none rounded-2xl border border-slate-600 bg-slate-900/80 px-3 py-2 text-sm outline-none focus:ring-1 focus:ring-emerald-400/70 max-h-32 min-h-[48px]"

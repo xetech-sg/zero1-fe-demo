@@ -1,62 +1,83 @@
 // app/api/asr/route.ts
 import { NextRequest, NextResponse } from "next/server";
 
-// Ensure this route runs on the Node.js runtime (not edge)
-export const runtime = "nodejs";
+export const runtime = "nodejs"; // Ensure we run in Node.js environment
 
 export async function POST(req: NextRequest) {
   try {
-    const asrServerUrl = process.env.ASR_SERVER_URL;
-    if (!asrServerUrl) {
+    const ASR_URL = process.env.ASR_SERVER_URL;
+    if (!ASR_URL) {
+      console.error("[/api/asr] ASR_SERVER_URL is not set in env");
       return NextResponse.json(
         { error: "ASR_SERVER_URL is not configured" },
         { status: 500 }
       );
     }
 
-    // Parse multipart/form-data from the frontend
-    const incomingForm = await req.formData();
-    const file = incomingForm.get("file");
+    console.log("[/api/asr] Forwarding audio to:", ASR_URL);
 
-    if (!file || !(file instanceof Blob)) {
+    // Read multipart/form-data from the incoming request
+    const formData = await req.formData();
+    const audio = formData.get("audio") as File | null;
+
+    if (!audio) {
+      console.error("[/api/asr] No 'audio' field found in form data");
       return NextResponse.json(
-        { error: "Missing audio file in 'file' field" },
+        { error: "Missing audio file" },
         { status: 400 }
       );
     }
 
-    // Prepare a new FormData to forward to the ASR backend
+    // Prepare new form-data to forward to the Python ASR backend
+    // Python endpoint expects the field name to be "file"
     const forwardForm = new FormData();
-    forwardForm.append("file", file, "audio.webm");
+    forwardForm.append("file", audio, "input.webm");
 
-    // Forward the request to the ASR backend (Python + Faster-Whisper)
-    const res = await fetch(asrServerUrl, {
+    // Forward the request to the ASR backend
+    const res = await fetch(ASR_URL, {
       method: "POST",
       body: forwardForm,
     });
 
     if (!res.ok) {
-      const text = await res.text().catch(() => "");
-      console.error("ASR backend error:", text);
+      const errorText = await res.text().catch(() => "");
+      console.error(
+        "[/api/asr] ASR backend returned non-OK status:",
+        res.status,
+        errorText
+      );
+      // Return error detail to frontend so you can see it in browser console
       return NextResponse.json(
-        { error: "ASR backend error", detail: text || undefined },
-        { status: 502 }
+        {
+          error: "ASR backend error",
+          backendStatus: res.status,
+          backendDetail: errorText,
+        },
+        { status: 500 }
       );
     }
 
-    // Expecting JSON: { "text": "..." }
-    const data = await res.json().catch(() => null);
+    // Expecting JSON like { "text": "..." }
+    const data = await res.json().catch((err) => {
+      console.error("[/api/asr] Failed to parse ASR backend JSON:", err);
+      return null;
+    });
 
     if (!data || typeof data.text !== "string") {
+      console.error("[/api/asr] ASR backend response missing 'text':", data);
       return NextResponse.json(
-        { error: "Invalid ASR response format" },
-        { status: 502 }
+        { error: "Invalid response from ASR backend" },
+        { status: 500 }
       );
     }
 
-    return NextResponse.json({ text: data.text });
+    const text = data.text.trim();
+
+    console.log("[/api/asr] Transcription OK:", text);
+
+    return NextResponse.json({ text });
   } catch (err) {
-    console.error("API /asr error:", err);
+    console.error("[/api/asr] Internal error:", err);
     return NextResponse.json(
       { error: "Internal server error in /api/asr" },
       { status: 500 }
